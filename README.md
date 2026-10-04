@@ -14,3 +14,13 @@ midファイルやフォルダをウインドウにドロップするとプレ�
 完全にCedexで作成したため作者は内容を全く理解していません。
 そのため自己責任で使用お願いします。
 
+## ライセンス
+MZDiskExplorerはMIT Licenseとします。
+
+## 作者について
+X/Twitter
+https://twitter.com/kuran_kuran
+
+## アルゴの記憶
+https://daimonsoft.info/argo/
+
