@@ -15,7 +15,7 @@ midファイルやフォルダをウインドウにドロップするとプレ�
 そのため自己責任で使用お願いします。
 
 ## ライセンス
-MZDiskExplorerはMIT Licenseとします。
+MIT Licenseとします。
 
 ## 作者について
 X/Twitter
