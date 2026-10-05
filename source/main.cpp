@@ -14,6 +14,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 namespace fs = std::filesystem;
+constexpr wchar_t AppTitle[] = L"MIDI Player 1.01";
 enum {
     OPEN = 100,
     STOP,
@@ -298,7 +299,7 @@ void Start(int i) {
     player->Start(playlist[i].song);
     SelectCurrent();
     status = L"再生中";
-    std::wstring title = EntryTitle(playlist[i]) + L" — MIDI Player";
+    std::wstring title = EntryTitle(playlist[i]) + L" — " + AppTitle;
     SetWindowTextW(win, title.c_str());
     InvalidateRect(list, nullptr, FALSE);
     SavePlaylist();
@@ -400,6 +401,13 @@ void RemoveSelectedPlaylistRows() {
     if (selected.empty())
         return;
     EndPlaylistDrag();
+    std::wstring question = selected.size() == 1
+        ? L"「" + EntryTitle(playlist[selected.front()]) + L"」をプレイリストから削除しますか？"
+        : L"選択した " + std::to_wstring(selected.size()) + L" 曲をプレイリストから削除しますか？";
+    question += L"\n\n元のMIDIファイルは削除されません。";
+    if (MessageBoxW(win, question.c_str(), L"曲の削除確認",
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+        return;
     auto original = playlist;
     for (auto row = selected.rbegin(); row != selected.rend(); ++row)
         playlist.erase(playlist.begin() + *row);
@@ -411,7 +419,7 @@ void RemoveSelectedPlaylistRows() {
     if (std::binary_search(selected.begin(), selected.end(), current)) {
         player->Stop();
         current = -1;
-        SetWindowTextW(win, L"MIDI Player");
+        SetWindowTextW(win, AppTitle);
     } else if (current >= 0)
         current -= (int)(std::lower_bound(selected.begin(), selected.end(), current) - selected.begin());
     SendMessageW(list, WM_SETREDRAW, FALSE, 0);
@@ -866,7 +874,7 @@ void Paint(HDC target) {
         Indicator(dc, v, port, top, rows == 2);
     }
     int x = meterW + 12;
-    std::wstring title = current >= 0 ? EntryTitle(playlist[current]) : L"MIDI Player";
+    std::wstring title = current >= 0 ? EntryTitle(playlist[current]) : AppTitle;
     Text(dc, {x, bottom + 8, width - 16, bottom + 36}, title, RGB(236, 243, 252));
     std::wstring state = v.paused ? L"一時停止" : v.playing ? L"再生中" : L"停止";
     if (loopMode == 1)
@@ -1001,7 +1009,7 @@ void Command(int id) {
         playlist.clear();
         current = -1;
         ListView_DeleteAllItems(list);
-        SetWindowTextW(win, L"MIDI Player");
+        SetWindowTextW(win, AppTitle);
         status = L"プレイリストをクリアしました";
         break;
     case FILEINFO:
@@ -1351,7 +1359,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int show) {
     wc.lpszClassName = L"MidiPlayerWindow";
     RegisterClassExW(&wc);
     auto h =
-        CreateWindowExW(0, wc.lpszClassName, L"MIDI Player", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+        CreateWindowExW(0, wc.lpszClassName, AppTitle, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                         CW_USEDEFAULT, CW_USEDEFAULT, 1100, 764, nullptr, nullptr, instance, nullptr);
     if (!h)
         return 1;
