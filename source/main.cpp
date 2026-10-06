@@ -14,7 +14,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 namespace fs = std::filesystem;
-constexpr wchar_t AppTitle[] = L"MIDI Player 1.01";
+constexpr wchar_t AppTitle[] = L"MIDI Player 1.02";
 enum {
     OPEN = 100,
     STOP,
@@ -40,6 +40,7 @@ enum {
     AUTORESET_XG,
     AUTORESET_GM,
     AUTORESET_OFF,
+    SILENCE_SKIP,
     PORTVIEW = 200,
     DEVICE = 1000
 };
@@ -53,6 +54,7 @@ std::unique_ptr<Player> player;
 std::vector<Entry> playlist;
 int current = -1, mode = 0, visiblePort = 0;
 bool autoReset = true;
+bool silenceSkip = false;
 int autoResetKind = 0;
 bool miniMode = false;
 bool restoreMini = false;
@@ -93,6 +95,8 @@ void LoadSettings() {
     restoreMini = read(L"Display", L"Mini", 0) == 1;
     autoReset = read(L"Options", L"AutoReset", 1) != 0;
     autoResetKind = std::clamp(read(L"Options", L"AutoResetKind", 0), 0, 2);
+    silenceSkip = read(L"Options", L"SilenceSkip", 0) != 0;
+    player->SetSilenceSkip(silenceSkip);
     player->SetAutoReset(autoReset, autoResetKind);
     loopMode = std::clamp(read(L"Options", L"Loop", 0), 0, 2);
     for (int p = 0; p < 6; ++p) {
@@ -128,6 +132,7 @@ bool SaveSettings() {
     write(L"Display", L"Mini", miniMode ? L"1" : L"0");
     write(L"Options", L"AutoReset", autoReset ? L"1" : L"0");
     write(L"Options", L"AutoResetKind", std::to_wstring(autoResetKind));
+    write(L"Options", L"SilenceSkip", silenceSkip ? L"1" : L"0");
     write(L"Options", L"Loop", std::to_wstring(loopMode));
     auto state = player->Snapshot();
     int selected = list && IsWindow(list) ? ListView_GetNextItem(list, -1, LVNI_SELECTED) : -1;
@@ -630,6 +635,9 @@ void BuildMenu() {
     AppendMenuW(opts, MF_STRING, AUTORESET_GM, L"曲の開始時にGM RESET");
     AppendMenuW(opts, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(opts, MF_STRING, AUTORESET_OFF, L"曲の開始時にRESETしない");
+    AppendMenuW(opts, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(opts, MF_STRING | (silenceSkip ? MF_CHECKED : MF_UNCHECKED),
+                SILENCE_SKIP, L"10秒以上無音なら曲を終了");
     AppendMenuW(menu, MF_POPUP, (UINT_PTR)opts, L"オプション");
     UpdateResetMenu();
     SetMenu(win, menu);
@@ -1017,6 +1025,12 @@ void Command(int id) {
         break;
     case REMOVE:
         RemoveSelectedPlaylistRows();
+        break;
+    case SILENCE_SKIP:
+        silenceSkip = !silenceSkip;
+        player->SetSilenceSkip(silenceSkip);
+        CheckMenuItem(menu, SILENCE_SKIP, MF_BYCOMMAND | (silenceSkip ? MF_CHECKED : MF_UNCHECKED));
+        SaveSettings();
         break;
     case EXITAPP:
         DestroyWindow(win);
