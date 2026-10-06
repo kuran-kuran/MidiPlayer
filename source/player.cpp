@@ -19,6 +19,7 @@ Player::~Player() {
 }
 void Player::ClearVisual() {
     for (int p = 0; p < 6; ++p) {
+        masterVolume[p] = 16383;
         view.displays[p] = {};
         displaySysex[p].clear();
     }
@@ -124,6 +125,7 @@ void Player::Start(std::shared_ptr<MidiSong> s) {
     base = 0;
     view.position = 0;
     view.bpm = 120;
+    lastSoundPosition = 0;
     view.multiPortMeters = false;
     view.playing = true;
     view.paused = false;
@@ -202,6 +204,11 @@ PlayerView Player::Snapshot() {
     std::lock_guard<std::mutex> l(mutex);
     return view;
 }
+void Player::SetSilenceSkip(bool enabled) {
+    std::lock_guard<std::mutex> l(mutex);
+    silenceSkip = enabled;
+    lastSoundPosition = view.position;
+}
 void Player::DisplayMessage(int port, const std::vector<uint8_t> &bytes) {
     auto &pending = displaySysex[port];
     if (bytes.empty()) return;
@@ -212,6 +219,15 @@ void Player::DisplayMessage(int port, const std::vector<uint8_t> &bytes) {
     if (pending.back() != 0xf7) return;
     auto message = std::move(pending);
     pending.clear();
+    // Track volume commands as they arrive; never inspect future song events.
+    if (message.size() == 8 && message[0] == 0xf0 && message[1] == 0x7f &&
+        message[3] == 4 && message[4] == 1 && message[5] < 128 && message[6] < 128) {
+        masterVolume[port] = message[5] | (message[6] << 7);
+        return;
+    }
+    if (message == MidiResetMessage(0) || message == MidiResetMessage(1) ||
+        message == MidiResetMessage(2))
+        masterVolume[port] = 16383;
     if (message.size() < 11 || message[0] != 0xf0 || message[1] != 0x41 ||
         message[2] > 0x1f || message[4] != 0x12) return;
     unsigned sum = 0;
@@ -220,6 +236,9 @@ void Player::DisplayMessage(int port, const std::vector<uint8_t> &bytes) {
         sum += message[i];
     }
     if (sum % 128) return;
+    if (message[3] == 0x42 && message.size() == 11 && message[5] == 0x40 &&
+        message[6] == 0 && message[7] == 4)
+        masterVolume[port] = message[8] * 129;
     auto &display = view.displays[port];
     // A GS Reset in the song restores normal activity display too.
     if (message[3] == 0x42 && message.size() == 11 && message[5] == 0x40 &&
@@ -313,7 +332,16 @@ void Player::Run() {
             if (elapsed >= 0) {
                 while (cursor < song->events.size() && song->events[cursor].seconds <= view.position)
                     Dispatch(song->events[cursor++]);
-                if (view.position >= song->duration && cursor == song->events.size()) {
+                bool audible = false;
+                for (int p = 0; p < 6; ++p)
+                    for (int c = 0; c < 16; ++c)
+                        if (masterVolume[p] && volume[p][c] && expression[p][c])
+                            for (int n = 0; n < 128; ++n)
+                                audible = audible || view.notes[p][c][n] != 0;
+                if (audible)
+                    lastSoundPosition = view.position;
+                if ((view.position >= song->duration && cursor == song->events.size()) ||
+                    (silenceSkip && view.position - lastSoundPosition >= 10.0)) {
                     view.playing = false;
                     Silence(true);
                     PostMessage(window, WM_SONG_DONE, generation, 0);

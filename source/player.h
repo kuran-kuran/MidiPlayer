@@ -44,6 +44,9 @@ class Player {
     double base = 0;
     bool resetOnSong = true;
     int resetKind = 0;
+    bool silenceSkip = false;
+    double lastSoundPosition = 0;
+    uint16_t masterVolume[6]{16383, 16383, 16383, 16383, 16383, 16383};
     uint8_t held[6][16][128]{};
     bool sustain[6][16]{};
     uint8_t volume[6][16]{}, expression[6][16]{};
@@ -71,6 +74,7 @@ class Player {
     void SetDevice(int port, int device);
     int GetDevice(int port);
     void SetAutoReset(bool v, int kind = 0);
+    void SetSilenceSkip(bool enabled);
     void Reset(int kind);
     PlayerView Snapshot();
     bool IsCompleted(WPARAM token);
