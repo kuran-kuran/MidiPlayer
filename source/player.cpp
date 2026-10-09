@@ -139,7 +139,7 @@ void Player::Start(std::shared_ptr<MidiSong> s) {
     view.paused = false;
     if (resetOnSong)
         ResetInternal(resetKind);
-    origin = std::chrono::steady_clock::now() + std::chrono::milliseconds(resetOnSong ? 100 : 0);
+    origin = std::chrono::steady_clock::now() + std::chrono::milliseconds(resetOnSong ? 500 : 0);
     cv.notify_all();
 }
 void Player::Stop() {
