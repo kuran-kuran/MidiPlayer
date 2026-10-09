@@ -9,12 +9,15 @@
 #include <windows.h>
 #include <fstream>
 #include <iterator>
+#include <iomanip>
+#include <cmath>
+#include <locale>
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comdlg32.lib")
 namespace fs = std::filesystem;
-constexpr wchar_t AppTitle[] = L"MIDI Player 1.02";
+constexpr wchar_t AppTitle[] = L"MIDI Player 1.03";
 enum {
     OPEN = 100,
     STOP,
@@ -41,17 +44,89 @@ enum {
     AUTORESET_GM,
     AUTORESET_OFF,
     SILENCE_SKIP,
+    AUDITION,
+    REGISTER_PLAYLIST,
     PORTVIEW = 200,
     DEVICE = 1000
 };
+bool FileStamp(const fs::path &path, uint64_t &size, uint64_t &modified) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes) ||
+        (attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+        return false;
+    size = ((uint64_t)attributes.nFileSizeHigh << 32) | attributes.nFileSizeLow;
+    modified = ((uint64_t)attributes.ftLastWriteTime.dwHighDateTime << 32) |
+               attributes.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
 struct Entry {
     fs::path path;
     std::shared_ptr<MidiSong> song;
+    bool loaded = true, stamped = false;
+    uint64_t size = 0, modified = 0;
+    Entry(fs::path p, std::shared_ptr<MidiSong> s) : path(std::move(p)), song(std::move(s)) {
+        stamped = FileStamp(path, size, modified);
+    }
 };
+const wchar_t CsvHeader[] = L"path,title,duration_seconds,smf_format,size,modified\r\n";
+std::wstring CsvQuote(const std::wstring &value) {
+    std::wstring result = L"\"";
+    for (wchar_t c : value) {
+        if (c == L'"') result += L'"';
+        result += c;
+    }
+    return result + L'"';
+}
+std::wstring CsvRow(const Entry &entry) {
+    std::wostringstream row;
+    row.imbue(std::locale::classic());
+    row << CsvQuote(fs::absolute(entry.path).wstring()) << L',' << CsvQuote(entry.song->title)
+        << L',' << std::setprecision(17) << entry.song->duration << L',' << entry.song->format << L',';
+    if (entry.stamped) row << entry.size << L',' << entry.modified;
+    else row << L',';
+    return row.str() + L"\r\n";
+}
+bool ParseCsv(const std::wstring &text, std::vector<std::vector<std::wstring>> &rows) {
+    std::vector<std::wstring> row;
+    std::wstring field;
+    bool quoted = false, closed = false;
+    for (size_t i = 0; i < text.size(); ++i) {
+        wchar_t c = text[i];
+        if (quoted) {
+            if (c == L'"') {
+                if (i + 1 < text.size() && text[i + 1] == L'"') { field += c; ++i; }
+                else { quoted = false; closed = true; }
+            } else field += c;
+        } else if (c == L',') {
+            row.push_back(std::move(field)); field.clear(); closed = false;
+        } else if (c == L'\r' || c == L'\n') {
+            if (c == L'\r' && i + 1 < text.size() && text[i + 1] == L'\n') ++i;
+            row.push_back(std::move(field)); field.clear();
+            rows.push_back(std::move(row)); row.clear(); closed = false;
+        } else if (c == L'"' && field.empty() && !closed) quoted = true;
+        else {
+            if (closed || c == L'"') return false;
+            field += c;
+        }
+    }
+    if (quoted) return false;
+    if (!field.empty() || !row.empty() || closed) {
+        row.push_back(std::move(field)); rows.push_back(std::move(row));
+    }
+    return true;
+}
+bool CsvUnsigned(const std::wstring &text, uint64_t &value) {
+    if (text.empty() || text.find_first_not_of(L"0123456789") != std::wstring::npos) return false;
+    try { value = std::stoull(text); return true; } catch (...) { return false; }
+}
 HWND win, list;
 int dragRow = -1, dragGap = -1;
 std::unique_ptr<Player> player;
 std::vector<Entry> playlist;
+std::vector<Entry> normalPlaylist, auditionPlaylist;
+bool auditionMode = false;
+int normalCurrent = -1, normalSelected = -1, normalRemembered = -1, normalMode = 0;
+int auditionCurrent = -1;
 int current = -1, mode = 0, visiblePort = 0;
 bool autoReset = true;
 bool silenceSkip = false;
@@ -73,6 +148,7 @@ HDC buffer = nullptr;
 HBITMAP dib = nullptr, oldBitmap = nullptr;
 int dibW = 0, dibH = 0;
 fs::path playlistDirectory;
+size_t playlistMetadataReads = 0;
 fs::path PlaylistFile(const wchar_t *name) {
     if (playlistDirectory.empty()) {
         std::vector<wchar_t> path(32768);
@@ -127,7 +203,7 @@ bool SaveSettings() {
         write(L"MIDIOutput", key, std::to_wstring(id));
         write(L"MIDIOutput", key + L"Name", id >= 0 && id < (int)deviceNames.size() ? deviceNames[id] : L"");
     }
-    write(L"Display", L"Mode", std::to_wstring(miniMode ? savedMode : mode));
+    write(L"Display", L"Mode", std::to_wstring(auditionMode ? normalMode : miniMode ? savedMode : mode));
     write(L"Display", L"Port", std::to_wstring(visiblePort));
     write(L"Display", L"Mini", miniMode ? L"1" : L"0");
     write(L"Options", L"AutoReset", autoReset ? L"1" : L"0");
@@ -138,9 +214,12 @@ bool SaveSettings() {
     int selected = list && IsWindow(list) ? ListView_GetNextItem(list, -1, LVNI_SELECTED) : -1;
     int remembered = (state.playing || state.paused) && current >= 0 ? current :
                      selected >= 0 ? selected : current;
-    if (remembered < 0 || remembered >= (int)playlist.size()) remembered = -1;
+    const auto &savedPlaylist = auditionMode ? normalPlaylist : playlist;
+    if (auditionMode)
+        remembered = normalRemembered;
+    if (remembered < 0 || remembered >= (int)savedPlaylist.size()) remembered = -1;
     write(L"Playlist", L"Index", std::to_wstring(remembered));
-    write(L"Playlist", L"Path", remembered >= 0 ? fs::absolute(playlist[remembered].path).wstring() : L"");
+    write(L"Playlist", L"Path", remembered >= 0 ? fs::absolute(savedPlaylist[remembered].path).wstring() : L"");
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
     if (ok)
         ok = MoveFileExW(path.c_str(), PlaylistFile(L"MidiPlayer.ini").c_str(),
@@ -154,11 +233,13 @@ bool PlaylistError(const wchar_t *action) {
              std::to_wstring(GetLastError()) + L")";
     return false;
 }
-bool SavePlaylist(bool empty = false) {
-    std::wstring lines;
+bool SavePlaylist(bool empty = false, const std::vector<Entry> *entries = nullptr) {
+    if (auditionMode && !entries)
+        return true;
+    std::wstring lines = CsvHeader;
     if (!empty)
-        for (const auto &entry : playlist)
-            lines += fs::absolute(entry.path).wstring() + L"\r\n";
+        for (const auto &entry : entries ? *entries : playlist)
+            lines += CsvRow(entry);
     int size = WideCharToMultiByte(CP_UTF8, 0, lines.data(), (int)lines.size(), nullptr, 0, nullptr, nullptr);
     std::string data("\xef\xbb\xbf"); // UTF-8 BOM makes Japanese paths readable in text editors.
     if (size) {
@@ -167,7 +248,7 @@ bool SavePlaylist(bool empty = false) {
                             nullptr);
     }
     auto temporary = PlaylistFile(L"playlist.tmp");
-    auto destination = PlaylistFile(L"playlist.txt");
+    auto destination = PlaylistFile(L"playlist.csv");
     HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
@@ -193,7 +274,9 @@ bool SavePlaylist(bool empty = false) {
     return true;
 }
 bool BackupAndClearPlaylist() {
-    auto source = PlaylistFile(L"playlist.txt"), backup = PlaylistFile(L"playlist.bak");
+    if (auditionMode)
+        return true;
+    auto source = PlaylistFile(L"playlist.csv"), backup = PlaylistFile(L"playlist.csv.bak");
     DWORD attributes = GetFileAttributesW(source.c_str());
     if (attributes != INVALID_FILE_ATTRIBUTES) {
         if (!CopyFileW(source.c_str(), backup.c_str(), FALSE))
@@ -297,9 +380,21 @@ void ShowFileInfo(int row) {
     layout.dialog.cy = 142;
     DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &layout.dialog, win, FileInfoProc, (LPARAM)&path);
 }
+void UpdateRow(int i, bool replace = false);
 void Start(int i) {
     if (i < 0 || i >= (int)playlist.size())
         return;
+    if (!playlist[i].loaded) {
+        try {
+            auto song = std::make_shared<MidiSong>(ReadMidi(playlist[i].path));
+            playlist[i] = Entry(playlist[i].path, std::move(song));
+            UpdateRow(i, true);
+        } catch (...) {
+            status = L"曲を読み込めません: " + playlist[i].path.filename().wstring();
+            InvalidateRect(win, nullptr, FALSE);
+            return;
+        }
+    }
     current = i;
     player->Start(playlist[i].song);
     SelectCurrent();
@@ -309,14 +404,18 @@ void Start(int i) {
     InvalidateRect(list, nullptr, FALSE);
     SavePlaylist();
 }
-void UpdateRow(int i) {
+void UpdateRow(int i, bool replace) {
     auto &e = playlist[i];
     LVITEMW item{};
     item.mask = LVIF_TEXT;
     item.iItem = i;
     auto title = EntryTitle(e);
     item.pszText = title.data();
-    ListView_InsertItem(list, &item);
+    if (replace) {
+        ListView_SetItemText(list, i, 0, title.data());
+    } else {
+        ListView_InsertItem(list, &item);
+    }
     auto duration = Time(e.song->duration);
     ListView_SetItemText(list, i, 1, duration.data());
     auto format = L"SMF " + std::to_wstring(e.song->format);
@@ -447,62 +546,113 @@ bool IsMidi(const fs::path &p) {
     return ext == L".mid" || ext == L".midi";
 }
 void LoadPlaylist() {
-    std::ifstream file(PlaylistFile(L"playlist.txt"), std::ios::binary);
-    if (!file)
+    playlistMetadataReads = 0;
+    bool legacy = GetFileAttributesW(PlaylistFile(L"playlist.csv").c_str()) == INVALID_FILE_ATTRIBUTES;
+    if (legacy && GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND) {
+        status = L"playlist.csv にアクセスできません";
         return;
+    }
+    auto source = PlaylistFile(legacy ? L"playlist.txt" : L"playlist.csv");
+    std::ifstream file(source, std::ios::binary);
+    if (!file) return;
     file.seekg(0, std::ios::end);
     auto size = file.tellg();
     if (size < 0 || size > 16 * 1024 * 1024) {
-        status = L"playlist.txt が大きすぎるため読み込めません";
+        status = L"プレイリストが大きすぎるため読み込めません";
         return;
     }
     file.seekg(0);
     std::string data((size_t)size, '\0');
     if (size && !file.read(data.data(), size)) {
-        status = L"playlist.txt を読み込めません";
+        status = L"プレイリストを読み込めません";
         return;
     }
+    file.close();
     if (data.compare(0, 3, "\xef\xbb\xbf") == 0)
         data.erase(0, 3);
-    if (data.empty())
+    if (data.empty()) {
+        if (legacy) SavePlaylist();
         return;
+    }
     int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data.data(), (int)data.size(), nullptr, 0);
     if (!count) {
-        status = L"playlist.txt はUTF-8で保存してください";
+        status = L"プレイリストはUTF-8で保存してください";
         return;
     }
     std::wstring lines(count, L'\0');
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, data.data(), (int)data.size(), lines.data(), count);
-    std::wistringstream stream(lines);
-    std::wstring line;
+    std::vector<std::vector<std::wstring>> rows;
+    if (legacy) {
+        std::wistringstream stream(lines);
+        std::wstring line;
+        while (std::getline(stream, line)) {
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
+            rows.push_back({line});
+        }
+    } else if (!ParseCsv(lines, rows)) {
+        status = L"CSVの引用符が不正です。プレイリストは書き換えていません";
+        return;
+    }
     std::set<fs::path> known;
-    size_t skipped = 0;
-    while (std::getline(stream, line)) {
-        if (!line.empty() && line.back() == L'\r')
-            line.pop_back();
-        if (line.empty())
-            continue;
-        fs::path path(line);
+    size_t skipped = 0, parsed = 0;
+    bool changed = legacy;
+    for (const auto &fields : rows) {
+        if (fields.empty() || fields[0].empty() || fields[0] == L"path") continue;
+        fs::path path(fields[0]);
         try {
             if (!path.is_absolute() || !IsMidi(path)) {
                 ++skipped;
                 continue;
             }
-            path = fs::weakly_canonical(path);
+            path = path.lexically_normal().make_preferred();
             if (!known.insert(path).second)
                 continue;
-            playlist.push_back({path, std::make_shared<MidiSong>(ReadMidi(path))});
+            uint64_t sizeNow = 0, modifiedNow = 0, savedSize = 0, savedModified = 0, format = 0;
+            bool stamp = FileStamp(path, sizeNow, modifiedNow);
+            double duration = -1;
+            if (fields.size() >= 6) {
+                std::wistringstream number(fields[2]);
+                number.imbue(std::locale::classic());
+                if (!(number >> duration) || !number.eof() || !std::isfinite(duration)) duration = -1;
+            }
+            bool cached = !legacy && fields.size() >= 6 && !fields[1].empty() && duration >= 0 &&
+                CsvUnsigned(fields[3], format) && format <= 1 &&
+                CsvUnsigned(fields[4], savedSize) && CsvUnsigned(fields[5], savedModified) &&
+                stamp && sizeNow == savedSize && modifiedNow == savedModified;
+            if (cached) {
+                auto metadata = std::make_shared<MidiSong>();
+                metadata->title = fields[1]; metadata->duration = duration; metadata->format = (int)format;
+                playlist.emplace_back(path, std::move(metadata));
+                playlist.back().loaded = false;
+            } else {
+                playlist.emplace_back(path, std::make_shared<MidiSong>(ReadMidi(path)));
+                // Only metadata needs to remain resident until this song is played.
+                auto metadata = std::make_shared<MidiSong>();
+                metadata->title = playlist.back().song->title;
+                metadata->duration = playlist.back().song->duration;
+                metadata->format = playlist.back().song->format;
+                playlist.back().song = std::move(metadata);
+                playlist.back().loaded = false;
+                ++parsed;
+                ++playlistMetadataReads;
+                changed = true;
+            }
             UpdateRow((int)playlist.size() - 1);
         } catch (...) {
             ++skipped;
         }
     }
     status = L"保存したプレイリストを復元: " + std::to_wstring(playlist.size()) + L" 曲";
+    if (parsed) status += L"（情報取得 " + std::to_wstring(parsed) + L" 曲）";
     if (skipped)
         status += L" (読み込み不可 " + std::to_wstring(skipped) + L" 件)";
+    // Do not remove unreadable rows from an existing CSV during startup.
+    if (changed && (legacy || !skipped))
+        SavePlaylist();
 }
 void AddPaths(const std::vector<fs::path> &paths) {
     int first = (int)playlist.size();
+    int firstRequested = -1;
     std::vector<fs::path> files;
     std::wstring errors;
     size_t failures = 0;
@@ -532,12 +682,18 @@ void AddPaths(const std::vector<fs::path> &paths) {
         std::error_code ec;
         auto full = fs::weakly_canonical(p, ec);
         if (ec)
-            full = p;
-        if (!known.insert(full).second)
+            full = fs::absolute(p).lexically_normal().make_preferred();
+        if (!known.insert(full).second) {
+            if (auditionMode && firstRequested < 0)
+                for (int i = 0; i < (int)playlist.size(); ++i)
+                    if (playlist[i].path == full) { firstRequested = i; break; }
             continue;
+        }
         try {
             auto song = std::make_shared<MidiSong>(ReadMidi(full));
             playlist.push_back({full, song});
+            if (firstRequested < 0)
+                firstRequested = (int)playlist.size() - 1;
             UpdateRow((int)playlist.size() - 1);
         } catch (const std::exception &e) {
             failures++;
@@ -550,13 +706,17 @@ void AddPaths(const std::vector<fs::path> &paths) {
     SetCursor(LoadCursor(nullptr, IDC_ARROW));
     if ((int)playlist.size() > first) {
         auto v = player->Snapshot();
-        if (!v.playing && !v.paused)
+        if (!auditionMode && !v.playing && !v.paused)
             Start(first);
         status = L"追加: " + std::to_wstring(playlist.size() - first) + L" 曲";
     } else
         status = L"追加できる新しいMIDIファイルがありません";
     if ((int)playlist.size() > first)
         SavePlaylist();
+    if (auditionMode && firstRequested >= 0) {
+        Start(firstRequested);
+        status = L"視聴中 — 通常リストへの追加は右クリック「プレイリスト登録」";
+    }
     if (failures)
         MessageBoxW(win, (errors + L"読み込めなかったファイル: " + std::to_wstring(failures)).c_str(),
                     L"MIDI読み込み", MB_OK | MB_ICONWARNING);
@@ -623,6 +783,7 @@ void BuildMenu() {
     AppendMenuW(display, MF_STRING, KEYS, L"鍵盤 (16ch)");
     AppendMenuW(display, MF_STRING, BOTH, L"プレイリスト + 鍵盤");
     AppendMenuW(display, MF_STRING, MINI, L"ミニウインドウ / 元に戻す");
+    AppendMenuW(display, MF_STRING, AUDITION, L"視聴 / 通常モードに戻す");
     AppendMenuW(display, MF_SEPARATOR, 0, nullptr);
     for (int p = 0; p < 6; p++) {
         auto s = L"鍵盤・メーター: ポート " + std::to_wstring(p);
@@ -669,19 +830,27 @@ void Layout() {
     }
     int x = 12, y = height - 40;
     for (size_t i = 0; i < buttons.size(); i++) {
-        bool visible = (i < 8 || i > 10) && (!miniMode || i < 5 || i >= 11);
+        bool visible = (i < 8 || i > 10) && (!miniMode || i < 5 || (i >= 11 && i < 15));
         ShowWindow(buttons[i], visible ? SW_SHOW : SW_HIDE);
         if (!visible)
             continue;
-        int w = i >= 12 ? 78 : i == 11 ? 58 : i >= 5 ? 72 : miniMode ? 56 : 64;
+        bool compactToolbar = !miniMode && width < 1000;
+        int w = i == 15 ? 58 : i >= 12 ? (compactToolbar ? 72 : 78) : i == 11 ? 58 :
+                i >= 5 ? (compactToolbar ? 64 : 72) : miniMode ? 56 : (compactToolbar ? 58 : 64);
         int buttonY = miniMode ? height - 34 : y;
         MoveWindow(buttons[i], x, buttonY, w, 28, TRUE);
-        if (i >= 12)
+        EnableWindow(buttons[i], !auditionMode || (i != 5 && i != 6 && i != 7 && i != 11));
+        if (i >= 12 && i <= 14)
             SendMessageW(buttons[i], BM_SETCHECK, (i == 12 ? loopMode == 1 :
                           i == 13 ? loopMode == 2 : loopMode == 0) ? BST_CHECKED : BST_UNCHECKED, 0);
         x += w + 5;
     }
     SetWindowTextW(buttons[11], miniMode ? L"戻す" : L"Mini");
+    if (buttons.size() > 15)
+        SetWindowTextW(buttons[15], auditionMode ? L"戻す" : L"視聴");
+    for (int id : {LIST, KEYS, BOTH, MINI})
+        EnableMenuItem(menu, id, MF_BYCOMMAND | (auditionMode ? MF_GRAYED : MF_ENABLED));
+    CheckMenuItem(menu, AUDITION, MF_BYCOMMAND | (auditionMode ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(menu, MINI, MF_BYCOMMAND | (miniMode ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuRadioItem(menu, LIST, BOTH, mode == 0 ? LIST : mode == 1 ? KEYS : BOTH, MF_BYCOMMAND);
     CheckMenuRadioItem(menu, PORTVIEW, PORTVIEW + 5, PORTVIEW + visiblePort, MF_BYCOMMAND);
@@ -709,6 +878,64 @@ void ToggleMini() {
     Layout();
     SelectCurrent();
 }
+void ToggleAudition() {
+    EndPlaylistDrag();
+    auto previousState = player->Snapshot();
+    player->Stop();
+    if (!auditionMode) {
+        if (miniMode)
+            ToggleMini();
+        normalMode = mode;
+        normalCurrent = current;
+        normalSelected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+        normalRemembered = (previousState.playing || previousState.paused) && current >= 0 ? current :
+                           normalSelected >= 0 ? normalSelected : current;
+        normalPlaylist = std::move(playlist);
+        playlist = std::move(auditionPlaylist);
+        current = auditionCurrent;
+        auditionMode = true;
+        mode = 2;
+    } else {
+        auditionCurrent = current;
+        auditionPlaylist = std::move(playlist);
+        playlist = std::move(normalPlaylist);
+        current = normalCurrent;
+        mode = normalMode;
+        auditionMode = false;
+    }
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(list);
+    for (int i = 0; i < (int)playlist.size(); ++i)
+        UpdateRow(i);
+    int selected = auditionMode ? current : normalSelected;
+    if (selected >= 0 && selected < (int)playlist.size()) {
+        ListView_SetItemState(list, selected, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(list, selected, FALSE);
+    }
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    SetWindowTextW(win, AppTitle);
+    status = auditionMode ? L"視聴モード — ファイルやフォルダをドロップしてください（保存されません）"
+                          : L"通常モードに戻りました";
+    Layout();
+    if (mode != 1) SetFocus(list);
+    InvalidateRect(list, nullptr, TRUE);
+}
+void RegisterAuditionSelection() {
+    if (!auditionMode) return;
+    size_t originalSize = normalPlaylist.size();
+    std::set<fs::path> known;
+    for (const auto &entry : normalPlaylist) known.insert(entry.path);
+    for (int row = -1; (row = ListView_GetNextItem(list, row, LVNI_SELECTED)) >= 0;)
+        if (known.insert(playlist[row].path).second)
+            normalPlaylist.push_back(playlist[row]);
+    size_t added = normalPlaylist.size() - originalSize;
+    if (added && !SavePlaylist(false, &normalPlaylist))
+        normalPlaylist.erase(normalPlaylist.begin() + originalSize, normalPlaylist.end());
+    else
+        status = added ? L"通常のプレイリストに登録: " + std::to_wstring(added) + L" 曲"
+                       : L"通常のプレイリストに登録できる新しい曲はありません";
+    InvalidateRect(win, nullptr, FALSE);
+}
 RECT KeyboardArea() {
     return {mode == 2 ? CombinedListWidth() : 8, 8, width - 8, height - 160};
 }
@@ -726,15 +953,54 @@ bool Black(int n) {
     int k = n % 12;
     return k == 1 || k == 3 || k == 6 || k == 8 || k == 10;
 }
+int KeyboardLeft(RECT area, bool overlay) {
+    return area.left + (overlay ? 121 : 83) + (mode == 1 ? 208 : 0);
+}
+void ChannelControls(HDC dc, int x, int y, int row, const PlayerView &v, int channel) {
+    int h = std::min(24, row - 2), top = y + (row - 2 - h) / 2;
+    COLORREF dim = RGB(58, 76, 92), bright = RGB(140, 190, 210);
+    for (int i = 0; i < 8; ++i)
+        Fill(dc, {x + i * 26, top, x + i * 26 + 24, top + h}, RGB(23, 35, 49));
+    int mid = top + h / 2;
+    Fill(dc, {x + 3, mid, x + 21, mid + 1}, dim);
+    Fill(dc, {x + 12, top + 2, x + 13, top + h - 2}, dim);
+    int pan = v.pan[visiblePort][channel];
+    int marker = x + 12 + (pan < 64 ? (pan - 64) * 9 / 64 : (pan - 64) * 9 / 63);
+    Fill(dc, {marker - 1, top + 2, marker + 2, top + h - 2}, bright);
+    auto bar = [&](int start, int value, COLORREF color) {
+        if (value < 0) {
+            Fill(dc, {start + 8, top + h / 2, start + 16, top + h / 2 + 1}, dim);
+            return;
+        }
+        int bottom = top + h - 2, length = (h - 4) * value / 127;
+        Fill(dc, {start + 8, top + 2, start + 16, bottom}, dim);
+        if (length)
+            Fill(dc, {start + 8, bottom - length, start + 16, bottom}, color);
+    };
+    bar(x + 26, v.volume[visiblePort][channel], RGB(65, 210, 168));
+    bar(x + 52, v.expression[visiblePort][channel], RGB(255, 183, 75));
+    COLORREF pedal = v.sustain[visiblePort][channel] ? RGB(110, 210, 255) : dim;
+    Fill(dc, {x + 84, top + 2, x + 93, top + h - 3}, pedal);
+    Fill(dc, {x + 82, top + h - 4, x + 96, top + h - 2}, pedal);
+    int bendX = x + 104;
+    Fill(dc, {bendX + 3, mid, bendX + 21, mid + 1}, dim);
+    Fill(dc, {bendX + 12, top + 2, bendX + 13, top + h - 2}, dim);
+    int bend = (int)v.pitchBend[visiblePort][channel] - 8192;
+    int bendMarker = bendX + 12 + bend * 9 / (bend < 0 ? 8192 : 8191);
+    Fill(dc, {bendMarker - 1, top + 2, bendMarker + 2, top + h - 2}, RGB(190, 155, 255));
+    bar(x + 130, v.modulation[visiblePort][channel], RGB(110, 210, 255));
+    bar(x + 156, v.reverb[visiblePort][channel], RGB(130, 160, 255));
+    bar(x + 182, v.chorus[visiblePort][channel], RGB(230, 145, 210));
+}
 void Keyboard(HDC dc, RECT area, const PlayerView &v) {
     bool overlay = visiblePort <= 1 && v.multiPortMeters;
     if (overlay) {
-        Text(dc, {area.left + 8, area.top, area.left + 90, area.top + 28}, L"PORT 0", RGB(65, 210, 168));
-        Text(dc, {area.left + 96, area.top, area.left + 178, area.top + 28}, L"PORT 1", RGB(255, 183, 75));
-        Text(dc, {area.left + 184, area.top, area.right, area.top + 28},
+        Text(dc, {area.left + 8, area.top, area.left + 90, area.top + 18}, L"PORT 0", RGB(65, 210, 168));
+        Text(dc, {area.left + 96, area.top, area.left + 178, area.top + 18}, L"PORT 1", RGB(255, 183, 75));
+        Text(dc, {area.left + 184, area.top, area.right, area.top + 18},
              L"番号クリック: PORT " + std::to_wstring(visiblePort) + L" のミュート");
     } else {
-        Text(dc, {area.left + 8, area.top, area.right, area.top + 28},
+        Text(dc, {area.left + 8, area.top, area.right, area.top + 18},
              L"PORT " + std::to_wstring(visiblePort) + L"  ·  16 CHANNELS  ·  番号クリックでミュート");
     }
     auto noteColor = [&](int channel, int note, COLORREF background) {
@@ -747,7 +1013,14 @@ void Keyboard(HDC dc, RECT area, const PlayerView &v) {
     };
     int top = area.top + 32, available = area.bottom - top;
     int row = std::max(12, available / 16);
-    int left = area.left + (overlay ? 121 : 83), right = area.right - 12;
+    int controls = area.left + (overlay ? 121 : 83);
+    int left = KeyboardLeft(area, overlay), right = area.right - 12;
+    const wchar_t *labels[] = {L"Pan", L"Vol", L"Exp", L"Sus", L"P.B", L"Mod", L"Rev", L"Cho"};
+    auto previousFont = SelectObject(dc, meterFont);
+    for (int i = 0; mode == 1 && i < 8; ++i)
+        Text(dc, {controls + i * 26, area.top + 18, controls + i * 26 + 24, top},
+             labels[i], RGB(140, 190, 210), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, previousFont);
     int whiteCount = 0;
     for (int n = 0; n < 128; n++)
         if (!Black(n))
@@ -763,16 +1036,18 @@ void Keyboard(HDC dc, RECT area, const PlayerView &v) {
             int program = v.programs[port][c];
             return program < 0 ? std::wstring(L"—") : std::to_wstring(program + 1);
         };
-        Fill(dc, {area.left + 45, y, left - 4, y + row - 2}, RGB(23, 35, 49));
+        Fill(dc, {area.left + 45, y, controls - 4, y + row - 2}, RGB(23, 35, 49));
         if (overlay) {
             Text(dc, {area.left + 45, y, area.left + 80, y + row - 2}, programText(0),
                  RGB(65, 210, 168), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            Text(dc, {area.left + 81, y, left - 4, y + row - 2}, programText(1),
+            Text(dc, {area.left + 81, y, controls - 4, y + row - 2}, programText(1),
                  RGB(255, 183, 75), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
-            Text(dc, {area.left + 45, y, left - 4, y + row - 2}, programText(visiblePort),
+            Text(dc, {area.left + 45, y, controls - 4, y + row - 2}, programText(visiblePort),
                  RGB(65, 210, 168), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
+        if (mode == 1)
+            ChannelControls(dc, controls, y, row, v, c);
         int widx = 0;
         for (int n = 0; n < 128; n++)
             if (!Black(n)) {
@@ -895,15 +1170,25 @@ void Paint(HDC target) {
     if (current >= 0)
         info += L"    SMF " + std::to_wstring(playlist[current].song->format) + L"    " +
                 std::to_wstring(current + 1) + L" / " + std::to_wstring(playlist.size());
-    Text(dc, {x, bottom + 38, width - 16, bottom + 60}, info, RGB(87, 218, 185));
-    RECT progress{x, bottom + 68, width - 20, bottom + 74};
+    if (!v.songSystem.empty() && !miniMode)
+        info += L"    " + v.songSystem;
+    if (miniMode) {
+        SelectObject(dc, font);
+        Text(dc, {x, bottom + 36, width - 16, bottom + 56}, info, RGB(87, 218, 185));
+        Text(dc, {x, bottom + 56, width - 16, bottom + 76}, v.songSystem, RGB(87, 218, 185));
+    } else
+        Text(dc, {x, bottom + 38, width - 16, bottom + 60}, info, RGB(87, 218, 185));
+    RECT progress{x, bottom + (miniMode ? 80 : 68), width - 20, bottom + (miniMode ? 86 : 74)};
     Fill(dc, progress, RGB(52, 68, 84));
     progress.right = progress.left + (int)((width - 20 - x) * (dur > 0 ? v.position / dur : 0));
     Fill(dc, progress, RGB(57, 213, 165));
-    Text(dc, {x, bottom + 81, width - 16, bottom + 106}, status, RGB(155, 177, 197));
+    Text(dc, {x, bottom + (miniMode ? 88 : 81), width - 16, bottom + (miniMode ? 110 : 106)},
+         status, RGB(155, 177, 197));
     BitBlt(target, 0, 0, width, height, dc, 0, 0, SRCCOPY);
 }
 void Command(int id) {
+    if (auditionMode && (id == LIST || id == KEYS || id == BOTH || id == MINI))
+        return;
     if (id >= DEVICE && id < DEVICE + 6 * 256) {
         int p = (id - DEVICE) / 256, d = (id - DEVICE) % 256;
         player->SetDevice(p, d == 0 ? -2 : d == 1 ? -1 : d - 2);
@@ -985,6 +1270,12 @@ void Command(int id) {
         break;
     case MINI:
         ToggleMini();
+        break;
+    case AUDITION:
+        ToggleAudition();
+        break;
+    case REGISTER_PLAYLIST:
+        RegisterAuditionSelection();
         break;
     case GS:
     case XG:
@@ -1077,10 +1368,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         const wchar_t *labels[] = {L"停止", L"一時停止", L"前へ",     L"再生",     L"次へ",     L"リスト",
                                    L"鍵盤", L"両方",     L"GS RESET", L"XG RESET", L"GM RESET", L"Mini",
-                                   L"1曲ループ", L"全曲ループ", L"ループ解除"};
-        const int ids[] = {STOP, PAUSE, PREV, PLAY, NEXT, LIST, KEYS, BOTH, GS, XG, GM, MINI, LOOP_ONE, LOOP_ALL, LOOP_OFF};
-        for (int i = 0; i < 15; i++) {
-            auto b = CreateWindowW(L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | (i >= 12 ? BS_AUTOCHECKBOX | BS_PUSHLIKE : BS_PUSHBUTTON), 0, 0, 10, 10,
+                                   L"1曲ループ", L"全曲ループ", L"ループ解除", L"視聴"};
+        const int ids[] = {STOP, PAUSE, PREV, PLAY, NEXT, LIST, KEYS, BOTH, GS, XG, GM, MINI, LOOP_ONE, LOOP_ALL, LOOP_OFF, AUDITION};
+        for (int i = 0; i < 16; i++) {
+            auto b = CreateWindowW(L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | (i >= 12 && i <= 14 ? BS_AUTOCHECKBOX | BS_PUSHLIKE : BS_PUSHBUTTON), 0, 0, 10, 10,
                                    h, (HMENU)(INT_PTR)ids[i], GetModuleHandle(nullptr), nullptr);
             SendMessageW(b, WM_SETFONT, (WPARAM)font, TRUE);
             buttons.push_back(b);
@@ -1091,6 +1382,19 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         SetTimer(h, 1, 33, nullptr);
         return 0;
     }
+    case WM_ACTIVATE:
+        if (LOWORD(w) != WA_INACTIVE && !HIWORD(w) && IsWindowEnabled(h) &&
+            GetFocus() != list && dragRow < 0 && list &&
+            (GetWindowLongPtrW(list, GWL_STYLE) & WS_VISIBLE)) {
+            SetFocus(list);
+            return 0;
+        }
+        break;
+    case WM_SETFOCUS:
+        if (IsWindowEnabled(h) && GetFocus() != list && dragRow < 0 && list &&
+            (GetWindowLongPtrW(list, GWL_STYLE) & WS_VISIBLE))
+            SetFocus(list);
+        return 0;
     case WM_SIZE:
         width = LOWORD(l);
         height = HIWORD(l);
@@ -1200,6 +1504,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         SetFocus(list);
         auto popup = CreatePopupMenu();
+        if (auditionMode) {
+            AppendMenuW(popup, MF_STRING, REGISTER_PLAYLIST, L"プレイリスト登録");
+            AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
+        }
         AppendMenuW(popup, MF_STRING, FILEINFO, L"ファイル情報...");
         AppendMenuW(popup, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(popup, MF_STRING, REMOVE, L"削除\tDel");
@@ -1220,6 +1528,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         if (n->hwndFrom == list && n->code == LVN_KEYDOWN) {
             if (((NMLVKEYDOWN *)l)->wVKey == VK_DELETE)
                 Command(REMOVE);
+            else if (((NMLVKEYDOWN *)l)->wVKey == VK_RETURN) {
+                int row = ListView_GetNextItem(list, -1, LVNI_SELECTED | LVNI_FOCUSED);
+                if (row < 0)
+                    row = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+                if (row >= 0)
+                    Start(row);
+            }
             return 0;
         }
         if (n->hwndFrom == list && n->code == LVN_BEGINDRAG) {

@@ -26,12 +26,16 @@ void Player::ClearVisual() {
     ZeroMemory(view.notes, sizeof(view.notes));
     ZeroMemory(view.levels, sizeof(view.levels));
     ZeroMemory(held, sizeof(held));
-    ZeroMemory(sustain, sizeof(sustain));
+    ZeroMemory(view.sustain, sizeof(view.sustain));
     for (int p = 0; p < 6; p++)
         for (int c = 0; c < 16; c++) {
             view.programs[p][c] = -1;
-            volume[p][c] = 100;
-            expression[p][c] = 127;
+            view.volume[p][c] = 100;
+            view.pitchBend[p][c] = 8192;
+            view.modulation[p][c] = 0;
+            view.reverb[p][c] = view.chorus[p][c] = -1;
+            view.pan[p][c] = 64;
+            view.expression[p][c] = 127;
         }
 }
 MidiOutput *Player::Output(int p) {
@@ -56,7 +60,7 @@ void Player::SendShort(int port, DWORD message) {
         h->Short(message);
 }
 void Player::Revoice(int p, int c) {
-    SendShort(p, 0xb0 | c | (64 << 8) | ((sustain[p][c] ? 127 : 0) << 16));
+    SendShort(p, 0xb0 | c | (64 << 8) | ((view.sustain[p][c] ? 127 : 0) << 16));
     if (view.muted[p][c])
         return;
     for (int n = 0; n < 128; ++n) {
@@ -121,6 +125,10 @@ void Player::Start(std::shared_ptr<MidiSong> s) {
     ++generation;
     Silence(true);
     song = s;
+    ZeroMemory(songMode, sizeof(songMode));
+    ZeroMemory(songMaps, sizeof(songMaps));
+    ZeroMemory(bankLsb, sizeof(bankLsb));
+    view.songSystem.clear();
     cursor = 0;
     base = 0;
     view.position = 0;
@@ -209,6 +217,29 @@ void Player::SetSilenceSkip(bool enabled) {
     silenceSkip = enabled;
     lastSoundPosition = view.position;
 }
+void Player::UpdateSongSystem() {
+    view.songSystem.clear();
+    for (int mode = 1; mode <= 4; ++mode) {
+        bool found = false;
+        unsigned maps = 0;
+        for (int p = 0; p < 6; ++p)
+            if (songMode[p] == mode) { found = true; maps |= songMaps[p]; }
+        if (!found) continue;
+        if (!view.songSystem.empty()) view.songSystem += L" / ";
+        view.songSystem += mode == 1 ? L"GM" : mode == 2 ? L"GM2" : mode == 3 ? L"GS" : L"XG";
+        if (mode == 3 && maps) {
+            view.songSystem += L": ";
+            const wchar_t *names[] = {L"SC-55 MAP", L"SC-88 MAP", L"SC-88Pro MAP", L"SC-8850 MAP"};
+            bool first = true;
+            for (int i = 0; i < 4; ++i)
+                if (maps & (1u << i)) {
+                    if (!first) view.songSystem += L" + ";
+                    view.songSystem += names[i];
+                    first = false;
+                }
+        }
+    }
+}
 void Player::DisplayMessage(int port, const std::vector<uint8_t> &bytes) {
     auto &pending = displaySysex[port];
     if (bytes.empty()) return;
@@ -219,6 +250,23 @@ void Player::DisplayMessage(int port, const std::vector<uint8_t> &bytes) {
     if (pending.back() != 0xf7) return;
     auto message = std::move(pending);
     pending.clear();
+    if (message.size() == 6 && message[0] == 0xf0 && message[1] == 0x7e &&
+        message[2] < 128 && message[3] == 9 && (message[4] == 1 || message[4] == 3)) {
+        songMode[port] = message[4] == 1 ? 1 : 2;
+        songMaps[port] = 0;
+        ZeroMemory(bankLsb[port], sizeof(bankLsb[port]));
+        masterVolume[port] = 16383;
+        UpdateSongSystem();
+    }
+    if (message.size() == 9 && message[0] == 0xf0 && message[1] == 0x43 &&
+        (message[2] & 0xf0) == 0x10 && message[3] == 0x4c && message[4] == 0 &&
+        message[5] == 0 && message[6] == 0x7e && message[7] == 0) {
+        songMode[port] = 4;
+        songMaps[port] = 0;
+        ZeroMemory(bankLsb[port], sizeof(bankLsb[port]));
+        masterVolume[port] = 16383;
+        UpdateSongSystem();
+    }
     // Track volume commands as they arrive; never inspect future song events.
     if (message.size() == 8 && message[0] == 0xf0 && message[1] == 0x7f &&
         message[3] == 4 && message[4] == 1 && message[5] < 128 && message[6] < 128) {
@@ -244,7 +292,19 @@ void Player::DisplayMessage(int port, const std::vector<uint8_t> &bytes) {
     if (message[3] == 0x42 && message.size() == 11 && message[5] == 0x40 &&
         message[6] == 0 && message[7] == 0x7f && message[8] == 0) {
         display = {};
+        songMode[port] = 3;
+        songMaps[port] = 0;
+        ZeroMemory(bankLsb[port], sizeof(bankLsb[port]));
+        masterVolume[port] = 16383;
+        UpdateSongSystem();
         return;
+    }
+    if (message[3] == 0x42 && message.size() == 11 &&
+        (message[5] == 0x40 || message[5] == 0x50) && (message[6] & 0xf0) == 0x40 &&
+        message[7] == 0 && message[8] >= 1 && message[8] <= 4) {
+        songMode[port] = 3;
+        songMaps[port] |= 1u << (message[8] - 1);
+        UpdateSongSystem();
     }
     if (message[3] != 0x45 || message[5] != 0x10 || message[7] != 0) return;
     size_t size = message.size() - 10;
@@ -288,20 +348,36 @@ void Player::Dispatch(const MidiEvent &e) {
         SendShort(p, e.message);
     if (type == 0xc0) {
         view.programs[p][c] = k;
+        if (songMode[p] == 3 && bankLsb[p][c] >= 1 && bankLsb[p][c] <= 4) {
+            songMaps[p] |= 1u << (bankLsb[p][c] - 1);
+            UpdateSongSystem();
+        }
     } else if (type == 0x90 && v) {
         held[p][c][k] = (uint8_t)v;
         view.notes[p][c][k] = (uint8_t)v;
     } else if (type == 0x80 || (type == 0x90 && !v)) {
         held[p][c][k] = 0;
-        if (!sustain[p][c])
+        if (!view.sustain[p][c])
             view.notes[p][c][k] = 0;
+    } else if (type == 0xe0) {
+        view.pitchBend[p][c] = (uint16_t)(k | (v << 7));
     } else if (type == 0xb0) {
+        if (k == 32)
+            bankLsb[p][c] = (uint8_t)v;
+        if (k == 1)
+            view.modulation[p][c] = (uint8_t)v;
+        if (k == 91)
+            view.reverb[p][c] = v;
+        if (k == 93)
+            view.chorus[p][c] = v;
         if (k == 7)
-            volume[p][c] = (uint8_t)v;
+            view.volume[p][c] = (uint8_t)v;
         if (k == 11)
-            expression[p][c] = (uint8_t)v;
+            view.expression[p][c] = (uint8_t)v;
+        if (k == 10)
+            view.pan[p][c] = (uint8_t)v;
         if (k == 64) {
-            sustain[p][c] = v >= 64;
+            view.sustain[p][c] = v >= 64;
             if (v < 64)
                 for (int n = 0; n < 128; n++)
                     if (!held[p][c][n])
@@ -309,12 +385,14 @@ void Player::Dispatch(const MidiEvent &e) {
         }
         if (k == 120 || k == 123) {
             ZeroMemory(held[p][c], 128);
-            if (k == 120 || !sustain[p][c])
+            if (k == 120 || !view.sustain[p][c])
                 ZeroMemory(view.notes[p][c], 128);
         }
         if (k == 121) {
-            sustain[p][c] = false;
-            expression[p][c] = 127;
+            view.pitchBend[p][c] = 8192;
+            view.modulation[p][c] = 0;
+            view.sustain[p][c] = false;
+            view.expression[p][c] = 127;
             for (int n = 0; n < 128; n++)
                 if (!held[p][c][n])
                     view.notes[p][c][n] = 0;
@@ -335,7 +413,7 @@ void Player::Run() {
                 bool audible = false;
                 for (int p = 0; p < 6; ++p)
                     for (int c = 0; c < 16; ++c)
-                        if (masterVolume[p] && volume[p][c] && expression[p][c])
+                        if (masterVolume[p] && view.volume[p][c] && view.expression[p][c])
                             for (int n = 0; n < 128; ++n)
                                 audible = audible || view.notes[p][c][n] != 0;
                 if (audible)
@@ -353,7 +431,7 @@ void Player::Run() {
                 int velocity = 0;
                 for (int n = 0; n < 128; n++)
                     velocity = std::max(velocity, (int)view.notes[p][c][n]);
-                float target = velocity / 127.f * volume[p][c] / 127.f * expression[p][c] / 127.f;
+                float target = velocity / 127.f * view.volume[p][c] / 127.f * view.expression[p][c] / 127.f;
                 view.levels[p][c] = std::max(target, view.levels[p][c] - 0.006f);
             }
         cv.wait_for(l, std::chrono::milliseconds(view.playing ? 1 : 10));
