@@ -22,11 +22,17 @@ struct PlayerView {
     bool playing = false, paused = false;
     int bpm = 120;
     bool multiPortMeters = false;
+    std::wstring songSystem;
     MidiDisplay displays[6];
     int programs[6][16]{}; // -1 until the song specifies a Program Change, otherwise MIDI 0..127.
     uint8_t notes[6][16][128]{};
     float levels[6][16]{};
     bool muted[6][16]{};
+    uint8_t pan[6][16]{}, volume[6][16]{}, expression[6][16]{};
+    bool sustain[6][16]{};
+    uint16_t pitchBend[6][16]{};
+    uint8_t modulation[6][16]{};
+    int reverb[6][16]{}, chorus[6][16]{}; // -1 until the song sends CC91/CC93.
 };
 class Player {
     std::mutex mutex;
@@ -47,9 +53,11 @@ class Player {
     bool silenceSkip = false;
     double lastSoundPosition = 0;
     uint16_t masterVolume[6]{16383, 16383, 16383, 16383, 16383, 16383};
+    int songMode[6]{}; // 1: GM, 2: GM2, 3: GS, 4: XG.
+    unsigned songMaps[6]{};
+    uint8_t bankLsb[6][16]{};
+    void UpdateSongSystem();
     uint8_t held[6][16][128]{};
-    bool sustain[6][16]{};
-    uint8_t volume[6][16]{}, expression[6][16]{};
     // Optional short-message transport lets tests verify the actual output stream without hardware.
     std::function<void(int, DWORD)> shortTransport;
     MidiOutput *Output(int port);
