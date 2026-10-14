@@ -4,12 +4,13 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <thread>
 #include <vector>
 constexpr WPARAM MIDI_OUTPUT_TIMEOUT = 0x10000, MIDI_OUTPUT_HOST_ERROR = 0x10001;
 // WinMM runs in an expendable child process; callers only enqueue messages.
 class MidiOutput {
-    struct Request { DWORD kind, message; std::vector<unsigned char> bytes; };
+    struct Request { DWORD kind, message; std::vector<unsigned char> bytes; std::shared_ptr<std::atomic<bool>> done; };
     HWND window;
     int device;
     std::mutex mutex;
@@ -33,6 +34,8 @@ class MidiOutput {
     ~MidiOutput();
     void Short(DWORD message);
     void Long(const std::vector<unsigned char> &bytes);
+    std::shared_ptr<std::atomic<bool>> LongCompleted(const std::vector<unsigned char> &bytes);
+    bool Failed() const { return failed.load(); }
     void Reset();
     void Shutdown(const std::vector<unsigned char> &reset = {});
     DWORD CompletedMessages() const { return completed.load(); }

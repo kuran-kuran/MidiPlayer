@@ -7,7 +7,7 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "shell32.lib")
 namespace {
-constexpr DWORD Open = 1, ShortMessage = 2, LongMessage = 3, ResetDevice = 4, CloseDevice = 5;
+constexpr DWORD Open = 1, ShortMessage = 2, LongMessage = 3, ResetDevice = 4, CloseDevice = 5, LongWait = 6;
 struct Packet { DWORD kind, message, size; };
 constexpr DWORD Timeout = 2000;
 constexpr size_t MaxQueueBytes = 16 * 1024 * 1024;
@@ -51,6 +51,11 @@ void MidiOutput::Queue(Request request) {
 }
 void MidiOutput::Short(DWORD message) { Queue({ShortMessage, message, {}}); }
 void MidiOutput::Long(const std::vector<unsigned char> &bytes) { Queue({LongMessage, 0, bytes}); }
+std::shared_ptr<std::atomic<bool>> MidiOutput::LongCompleted(const std::vector<unsigned char> &bytes) {
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    Queue({LongWait, 0, bytes, done});
+    return done;
+}
 void MidiOutput::Reset() {
     // Stop/pause must discard old note starts still waiting for a slow output.
     {
@@ -169,6 +174,7 @@ void MidiOutput::Run() {
                     queuedBytes -= request.bytes.size();
                 }
                 if (!Exchange(request)) break;
+                if (request.done) *request.done = true;
             }
         }
     }
@@ -222,8 +228,9 @@ int RunMidiOutputHostFromCommandLine(bool testDrivers) {
         }
         DWORD result = 0;
         if (simulated) {
+            if (id == -13 && packet.kind == LongWait) Sleep(250);
             if ((id == -3 && packet.kind == Open) || (id == -4 && packet.kind == ShortMessage) ||
-                (id == -5 && packet.kind == LongMessage) || (id == -6 && packet.kind == ResetDevice) ||
+                (id == -5 && (packet.kind == LongMessage || packet.kind == LongWait)) || (id == -6 && packet.kind == ResetDevice) ||
                 (id == -12 && packet.kind == CloseDevice))
                 Sleep(INFINITE);
             if (packet.kind == CloseDevice && id <= -8 && id >= -11) {
@@ -238,7 +245,7 @@ int RunMidiOutputHostFromCommandLine(bool testDrivers) {
             result = midiOutOpen(&output, id == -1 ? MIDI_MAPPER : (UINT)id, 0, 0, CALLBACK_NULL);
         } else if (!output) result = MMSYSERR_INVALHANDLE;
         else if (packet.kind == ShortMessage) result = midiOutShortMsg(output, packet.message);
-        else if (packet.kind == LongMessage) {
+        else if ((packet.kind == LongMessage || packet.kind == LongWait)) {
             auto message = std::make_unique<Pending>();
             message->bytes = std::move(bytes);
             message->header.lpData = (LPSTR)message->bytes.data();
@@ -283,6 +290,17 @@ int RunMidiOutputHostFromCommandLine(bool testDrivers) {
             if (!result) output = nullptr;
         } else if (packet.kind == ResetDevice) result = midiOutReset(output);
         else result = MMSYSERR_INVALPARAM;
+        if (packet.kind == LongWait && !result) {
+            while (!pending.empty()) {
+                for (auto it = pending.begin(); it != pending.end();) {
+                    if (((*it)->header.dwFlags & MHDR_DONE) &&
+                        midiOutUnprepareHeader(output, &(*it)->header, sizeof(MIDIHDR)) == MMSYSERR_NOERROR)
+                        it = pending.erase(it);
+                    else ++it;
+                }
+                if (!pending.empty()) Sleep(1);
+            }
+        }
         if (!HostTransfer(pipe, &result, sizeof(result), true)) break;
         if (packet.kind == CloseDevice) break;
     }

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <set>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <sstream>
 #include <windows.h>
 #include <fstream>
@@ -15,9 +16,10 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "comdlg32.lib")
 namespace fs = std::filesystem;
-constexpr wchar_t AppTitle[] = L"MIDI Player 1.03";
+constexpr wchar_t AppTitle[] = L"MIDI Player 1.04";
 enum {
     OPEN = 100,
     STOP,
@@ -328,9 +330,15 @@ std::wstring EntryTitle(const Entry &entry) {
     auto trimmed = first == std::wstring::npos ? L"" : title.substr(first, last - first + 1);
     return _wcsicmp(trimmed.c_str(), L"untitled") == 0 ? entry.path.filename().wstring() : title;
 }
+struct FileInfoData {
+    fs::path path;
+    std::wstring title;
+};
 INT_PTR CALLBACK FileInfoProc(HWND dialog, UINT message, WPARAM w, LPARAM l) {
     if (message == WM_INITDIALOG) {
-        auto path = reinterpret_cast<const fs::path *>(l);
+        auto info = reinterpret_cast<const FileInfoData *>(l);
+        SetWindowLongPtrW(dialog, DWLP_USER, l);
+        auto path = &info->path;
         RECT client;
         GetClientRect(dialog, &client);
         int dialogWidth = client.right, dialogHeight = client.bottom;
@@ -345,9 +353,14 @@ INT_PTR CALLBACK FileInfoProc(HWND dialog, UINT message, WPARAM w, LPARAM l) {
         control(L"STATIC", L"ファイル名", 0, 12, 12, dialogWidth - 24, 22, 0);
         auto name = control(L"EDIT", path->filename().c_str(), WS_TABSTOP | ES_READONLY | ES_AUTOHSCROLL,
                             12, 36, dialogWidth - 24, 28, 201);
-        control(L"STATIC", L"フルパス（選択して Ctrl+C でコピーできます）", 0, 12, 74, dialogWidth - 24, 22, 0);
+        control(L"STATIC", L"曲名（MIDI内のタイトル）", 0, 12, 74, dialogWidth - 24, 22, 0);
+        control(L"EDIT", info->title.c_str(), WS_TABSTOP | ES_READONLY | ES_AUTOHSCROLL,
+                12, 98, dialogWidth - 24, 28, 203);
+        control(L"STATIC", L"フルパス（選択して Ctrl+C でコピーできます）", 0, 12, 136, dialogWidth - 24, 22, 0);
         control(L"EDIT", path->c_str(), WS_TABSTOP | ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
-                12, 98, dialogWidth - 24, dialogHeight - 148, 202);
+                12, 160, dialogWidth - 24, dialogHeight - 210, 202);
+        control(L"BUTTON", L"フォルダを開く", WS_TABSTOP | BS_PUSHBUTTON,
+                dialogWidth - 237, dialogHeight - 38, 130, 28, 204);
         control(L"BUTTON", L"閉じる", WS_TABSTOP | BS_DEFPUSHBUTTON,
                 dialogWidth - 98, dialogHeight - 38, 86, 28, IDOK);
         RECT owner;
@@ -361,6 +374,25 @@ INT_PTR CALLBACK FileInfoProc(HWND dialog, UINT message, WPARAM w, LPARAM l) {
         SendMessageW(name, EM_SETSEL, 0, -1);
         return FALSE;
     }
+    if (message == WM_COMMAND && LOWORD(w) == 204) {
+        auto info = reinterpret_cast<const FileInfoData *>(GetWindowLongPtrW(dialog, DWLP_USER));
+        if (info) {
+            HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+            PIDLIST_ABSOLUTE item = nullptr;
+            HRESULT result = initialized;
+            if (SUCCEEDED(initialized) || initialized == RPC_E_CHANGED_MODE)
+                result = SHParseDisplayName(info->path.c_str(), nullptr, &item, 0, nullptr);
+            if (SUCCEEDED(result)) {
+                result = SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
+                CoTaskMemFree(item);
+            }
+            if (SUCCEEDED(initialized)) CoUninitialize();
+            if (FAILED(result))
+                MessageBoxW(dialog, L"ファイルを選択してフォルダを開けませんでした。ファイルが存在するか確認してください。",
+                            L"ファイル情報", MB_OK | MB_ICONERROR);
+        }
+        return TRUE;
+    }
     if ((message == WM_COMMAND && (LOWORD(w) == IDOK || LOWORD(w) == IDCANCEL)) || message == WM_CLOSE) {
         EndDialog(dialog, IDOK);
         return TRUE;
@@ -369,7 +401,7 @@ INT_PTR CALLBACK FileInfoProc(HWND dialog, UINT message, WPARAM w, LPARAM l) {
 }
 void ShowFileInfo(int row) {
     if (row < 0 || row >= (int)playlist.size()) return;
-    auto path = fs::absolute(playlist[row].path);
+    FileInfoData info{fs::absolute(playlist[row].path), playlist[row].song->title};
     struct Template {
         DLGTEMPLATE dialog;
         WORD menu = 0, windowClass = 0;
@@ -377,8 +409,8 @@ void ShowFileInfo(int row) {
     } layout{};
     layout.dialog.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME;
     layout.dialog.cx = 340;
-    layout.dialog.cy = 142;
-    DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &layout.dialog, win, FileInfoProc, (LPARAM)&path);
+    layout.dialog.cy = 180;
+    DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &layout.dialog, win, FileInfoProc, (LPARAM)&info);
 }
 void UpdateRow(int i, bool replace = false);
 void Start(int i) {
@@ -715,7 +747,7 @@ void AddPaths(const std::vector<fs::path> &paths) {
         SavePlaylist();
     if (auditionMode && firstRequested >= 0) {
         Start(firstRequested);
-        status = L"視聴中 — 通常リストへの追加は右クリック「プレイリスト登録」";
+        status = L"試聴中 — 通常リストへの追加は右クリック「プレイリスト登録」";
     }
     if (failures)
         MessageBoxW(win, (errors + L"読み込めなかったファイル: " + std::to_wstring(failures)).c_str(),
@@ -783,7 +815,7 @@ void BuildMenu() {
     AppendMenuW(display, MF_STRING, KEYS, L"鍵盤 (16ch)");
     AppendMenuW(display, MF_STRING, BOTH, L"プレイリスト + 鍵盤");
     AppendMenuW(display, MF_STRING, MINI, L"ミニウインドウ / 元に戻す");
-    AppendMenuW(display, MF_STRING, AUDITION, L"視聴 / 通常モードに戻す");
+    AppendMenuW(display, MF_STRING, AUDITION, L"試聴 / 通常モードに戻す");
     AppendMenuW(display, MF_SEPARATOR, 0, nullptr);
     for (int p = 0; p < 6; p++) {
         auto s = L"鍵盤・メーター: ポート " + std::to_wstring(p);
@@ -819,7 +851,7 @@ void Layout() {
     int bottom = height - 152;
     int listW = mode == 2 ? CombinedListWidth() : width;
     ShowWindow(list, mode == 1 ? SW_HIDE : SW_SHOW);
-    MoveWindow(list, 8, 8, listW - 16, std::max(10, bottom - 16), TRUE);
+    MoveWindow(list, 8, 8, listW - 16, std::max(10, bottom - 16 - (miniMode ? 32 : 0)), TRUE);
     ListView_SetColumnWidth(list, 0, std::max(120, listW - (mode == 2 ? 105 : 170)));
     ListView_SetColumnWidth(list, 1, 65);
     ListView_SetColumnWidth(list, 2, mode == 2 ? 0 : 65);
@@ -837,6 +869,8 @@ void Layout() {
         bool compactToolbar = !miniMode && width < 1000;
         int w = i == 15 ? 58 : i >= 12 ? (compactToolbar ? 72 : 78) : i == 11 ? 58 :
                 i >= 5 ? (compactToolbar ? 64 : 72) : miniMode ? 56 : (compactToolbar ? 58 : 64);
+        if (miniMode && i == 1)
+            w = 76;
         int buttonY = miniMode ? height - 34 : y;
         MoveWindow(buttons[i], x, buttonY, w, 28, TRUE);
         EnableWindow(buttons[i], !auditionMode || (i != 5 && i != 6 && i != 7 && i != 11));
@@ -847,7 +881,7 @@ void Layout() {
     }
     SetWindowTextW(buttons[11], miniMode ? L"戻す" : L"Mini");
     if (buttons.size() > 15)
-        SetWindowTextW(buttons[15], auditionMode ? L"戻す" : L"視聴");
+        SetWindowTextW(buttons[15], auditionMode ? L"戻す" : L"試聴");
     for (int id : {LIST, KEYS, BOTH, MINI})
         EnableMenuItem(menu, id, MF_BYCOMMAND | (auditionMode ? MF_GRAYED : MF_ENABLED));
     CheckMenuItem(menu, AUDITION, MF_BYCOMMAND | (auditionMode ? MF_CHECKED : MF_UNCHECKED));
@@ -868,7 +902,7 @@ void ToggleMini() {
         compactPlacement.showCmd = IsWindowVisible(win) ? SW_SHOWNORMAL : SW_HIDE;
         compactPlacement.flags = 0;
         compactPlacement.rcNormalPosition.right = compactPlacement.rcNormalPosition.left + 720;
-        compactPlacement.rcNormalPosition.bottom = compactPlacement.rcNormalPosition.top + 324;
+        compactPlacement.rcNormalPosition.bottom = compactPlacement.rcNormalPosition.top + 356;
         SetWindowPlacement(win, &compactPlacement);
     } else {
         miniMode = false;
@@ -914,7 +948,7 @@ void ToggleAudition() {
     }
     SendMessageW(list, WM_SETREDRAW, TRUE, 0);
     SetWindowTextW(win, AppTitle);
-    status = auditionMode ? L"視聴モード — ファイルやフォルダをドロップしてください（保存されません）"
+    status = auditionMode ? L"試聴モード — ファイルやフォルダをドロップしてください（保存されません）"
                           : L"通常モードに戻りました";
     Layout();
     if (mode != 1) SetFocus(list);
@@ -1070,6 +1104,34 @@ void Keyboard(HDC dc, RECT area, const PlayerView &v) {
         }
     }
 }
+void MiniKeyboard(HDC dc, RECT area, const PlayerView &v) {
+    int whiteCount = 0;
+    for (int n = 0; n < 128; ++n)
+        if (!Black(n)) ++whiteCount;
+    auto color = [&](int note, COLORREF background) {
+        for (int port = 0; port < 6; ++port)
+            for (int channel = 0; channel < 16; ++channel)
+                if (v.notes[port][channel][note])
+                    return RGB(65, 210, 168);
+        return background;
+    };
+    int span = area.right - area.left, white = 0;
+    for (int n = 0; n < 128; ++n) {
+        if (Black(n)) continue;
+        int x = area.left + white * span / whiteCount;
+        int next = area.left + (++white) * span / whiteCount;
+        Fill(dc, {x, area.top, next - 1, area.bottom}, color(n, RGB(210, 220, 229)));
+    }
+    white = 0;
+    int keyWidth = std::max(2, span * 3 / (whiteCount * 5));
+    for (int n = 0; n < 128; ++n) {
+        if (!Black(n)) { ++white; continue; }
+        int x = area.left + white * span / whiteCount;
+        Fill(dc, {x - keyWidth / 2, area.top, x + (keyWidth + 1) / 2,
+                  area.top + (area.bottom - area.top) * 60 / 100},
+             color(n, RGB(24, 32, 45)));
+    }
+}
 void Indicator(HDC dc, const PlayerView &v, int port, int top, bool compact) {
     Fill(dc, {0, top, 240, top + (compact ? 53 : 108)}, RGB(27, 39, 55));
     const auto &display = v.displays[port];
@@ -1143,6 +1205,8 @@ void Paint(HDC target) {
     Fill(dc, {0, 0, width, height}, RGB(18, 26, 39));
     auto v = player->Snapshot();
     int bottom = height - 152;
+    if (miniMode)
+        MiniKeyboard(dc, {8, bottom - 32, width - 8, bottom - 4}, v);
     if (mode)
         Keyboard(dc, KeyboardArea(), v);
     else if (playlist.empty())
@@ -1368,7 +1432,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         const wchar_t *labels[] = {L"停止", L"一時停止", L"前へ",     L"再生",     L"次へ",     L"リスト",
                                    L"鍵盤", L"両方",     L"GS RESET", L"XG RESET", L"GM RESET", L"Mini",
-                                   L"1曲ループ", L"全曲ループ", L"ループ解除", L"視聴"};
+                                   L"1曲ループ", L"全曲ループ", L"ループ解除", L"試聴"};
         const int ids[] = {STOP, PAUSE, PREV, PLAY, NEXT, LIST, KEYS, BOTH, GS, XG, GM, MINI, LOOP_ONE, LOOP_ALL, LOOP_OFF, AUDITION};
         for (int i = 0; i < 16; i++) {
             auto b = CreateWindowW(L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | (i >= 12 && i <= 14 ? BS_AUTOCHECKBOX | BS_PUSHLIKE : BS_PUSHBUTTON), 0, 0, 10, 10,
@@ -1402,7 +1466,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             Layout();
         return 0;
     case WM_GETMINMAXINFO:
-        ((MINMAXINFO *)l)->ptMinTrackSize = miniMode ? POINT{660, 274} : POINT{mode == 2 ? 1080 : 920, 604};
+        ((MINMAXINFO *)l)->ptMinTrackSize = miniMode ? POINT{680, 306} : POINT{mode == 2 ? 1080 : 920, 604};
         return 0;
     case WM_MOUSEMOVE:
         if (dragRow >= 0) {
