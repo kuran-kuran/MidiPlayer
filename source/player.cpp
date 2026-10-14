@@ -101,6 +101,8 @@ void Player::Silence(bool erase) {
             p.second->Short(0xb0 | c | (120 << 8));
         }
     }
+    resetPending.clear();
+    resetDelay = false;
     if (erase)
         ClearVisual();
 }
@@ -109,12 +111,15 @@ const std::vector<uint8_t> &MidiResetMessage(int kind) {
         xg{0xf0, 0x43, 0x10, 0x4c, 0, 0, 0x7e, 0, 0xf7}, gm{0xf0, 0x7e, 0x7f, 9, 1, 0xf7};
     return kind == 0 ? gs : kind == 1 ? xg : gm;
 }
-void Player::ResetInternal(int kind) {
+void Player::ResetInternal(int kind, bool waitForCompletion) {
     std::vector<MidiOutput *> sent;
     for (int p = 0; p < 6; p++) {
         auto h = Output(p);
         if (h && std::find(sent.begin(), sent.end(), h) == sent.end()) {
-            SendLong(h, MidiResetMessage(kind));
+            if (waitForCompletion)
+                resetPending.emplace_back(h, h->LongCompleted(MidiResetMessage(kind)));
+            else
+                SendLong(h, MidiResetMessage(kind));
             sent.push_back(h);
         }
     }
@@ -138,8 +143,9 @@ void Player::Start(std::shared_ptr<MidiSong> s) {
     view.playing = true;
     view.paused = false;
     if (resetOnSong)
-        ResetInternal(resetKind);
-    origin = std::chrono::steady_clock::now() + std::chrono::milliseconds(resetOnSong ? 500 : 0);
+        ResetInternal(resetKind, true);
+    resetDelay = resetOnSong;
+    origin = std::chrono::steady_clock::now();
     cv.notify_all();
 }
 void Player::Stop() {
@@ -170,6 +176,10 @@ void Player::Resume() {
             for (int c = 0; c < 16; c++)
                 Revoice(p, c);
         origin = std::chrono::steady_clock::now();
+        if (cursor == 0 && resetOnSong) {
+            ResetInternal(resetKind, true);
+            resetDelay = true;
+        }
         view.playing = true;
         view.paused = false;
         cv.notify_all();
@@ -405,6 +415,18 @@ void Player::Run() {
     while (!quit) {
         if (view.playing && song) {
             auto now = std::chrono::steady_clock::now();
+            if (resetDelay) {
+                bool ready = true;
+                for (auto &pending : resetPending)
+                    ready = ready && (pending.second->load() || pending.first->Failed());
+                if (!ready) {
+                    cv.wait_for(l, std::chrono::milliseconds(1));
+                    continue;
+                }
+                resetPending.clear();
+                resetDelay = false;
+                origin = now + std::chrono::seconds(1);
+            }
             double elapsed = std::chrono::duration<double>(now - origin).count();
             view.position = std::min(song->duration, std::max(0.0, base + elapsed));
             if (elapsed >= 0) {

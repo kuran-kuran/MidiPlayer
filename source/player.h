@@ -65,7 +65,9 @@ class Player {
     void Revoice(int port, int channel);
     void SendLong(MidiOutput *h, const std::vector<uint8_t> &bytes);
     void Silence(bool erase);
-    void ResetInternal(int kind);
+    void ResetInternal(int kind, bool waitForCompletion = false);
+    std::vector<std::pair<MidiOutput *, std::shared_ptr<std::atomic<bool>>>> resetPending;
+    bool resetDelay = false;
     void Run();
     void Dispatch(const MidiEvent &e);
     void ClearVisual();
