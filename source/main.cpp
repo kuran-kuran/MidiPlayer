@@ -19,7 +19,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "comdlg32.lib")
 namespace fs = std::filesystem;
-constexpr wchar_t AppTitle[] = L"MIDI Player 1.04";
+constexpr wchar_t AppTitle[] = L"MIDI Player 1.05";
 enum {
     OPEN = 100,
     STOP,
